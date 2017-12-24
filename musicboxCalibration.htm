@@ -1,0 +1,118 @@
+
+<select id=webMidiSelect></select>
+
+<form>
+<table></table>
+</form>
+
+<button onclick='send(1);' >Send all</button>
+
+<br><br><br><textarea style='width:800px'></textarea><button onclick='load();' >Load</button>
+
+
+<div id=sendtest></div>
+<script>
+noteLookup = [ 
+  48, //C3
+  50, //D3
+  55, //G3
+  57, //A3
+  59, //B3
+  60,
+  62,
+  64,
+  65, //F4
+  66,
+  67,
+  68,
+  69,
+  70,
+  71,
+  72,
+  73,
+  74,
+  75,
+  76,
+  77,
+  78,
+  79,
+  80,
+  81,
+  82,
+  83, //B5
+  84, //C6
+  86, //D6
+  88
+]
+
+
+s="";
+for (var i=1;i<16;i++){
+  s+="<tr>"
+  s+="<td>"+i+"</td><td><input type=range id=num_"+i+" value=0 min=-64 max=63 oninput='calib(this,"+i+")'></td>"
+  s+="<td>"+(i+15)+"</td><td><input type=range id=num_"+(i+15)+" value=0 min=-64 max=63 oninput='calib(this,"+(i+15)+")'></td>"
+  s+="</tr>"
+}
+document.querySelector('table').innerHTML=s;
+tex=document.querySelector('textarea');
+
+s=""
+for (var i=1;i<=30;i++){
+ s+="<button onclick='midiOut.send([0x90,"+(noteLookup[i+29])+",64])'>"+i+"</button>"
+}
+document.getElementById('sendtest').innerHTML=s;
+
+//document.querySelector('form').onchange=function(){
+function calib(obj, n){
+  var a=[]
+  for (var i=1;i<=30;i++){
+    a.push(1*document.getElementById('num_'+i).value);
+  }
+  tex.value=JSON.stringify(a);
+
+  midiOut.send( [ 0xAA, n-1, obj.value*1+64 ] )
+}
+function load(){
+  var t=JSON.parse(tex.value);
+  for (var i=1;i<=30;i++){
+    document.getElementById('num_'+i).value=t[i-1];
+  }
+}
+function send(i){
+  midiOut.send( [ 0xAA, i-1, document.getElementById('num_'+i).value*1+64 ] )
+  if (i<30)  {
+    i++;
+    setTimeout( function(){send(i)}, 300)
+  }
+}
+
+
+midiOut=null;
+function populatemidiOutSelect() {
+  selectMIDI.options.length = 0;
+  
+  midiAccess.outputs.forEach( function(i) {
+    selectMIDI.appendChild(new Option(i.name,i.id,midiOut==i,midiOut==i));
+  });
+  
+
+  if (midiOut&&midiOut.state=="disconnected") selectMIDI.onchange();
+}
+
+window.addEventListener("load",function() {
+  if (navigator.requestMIDIAccess) navigator.requestMIDIAccess().then( function(midi) {
+       
+    midiAccess = midi;
+    log=document.getElementById("log");
+    selectMIDI=document.getElementById("webMidiSelect");
+    (midi.onstatechange = populatemidiOutSelect)();
+    (selectMIDI.onchange = function() {
+       if (midiOut) midiOut.onmidimessage = null;
+       if (selectMIDI.options.length) midiOut = midiAccess.outputs.get(selectMIDI[selectMIDI.selectedIndex].value);
+    })();
+  });
+});
+
+
+
+</script>
