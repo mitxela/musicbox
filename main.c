@@ -7,24 +7,12 @@
 #include "stm32f10x_lib.h"
 
 
-
-
-
-//s8 temp=0;
-
 u8 timeout= 0;
 u16 phase = 0;
 
 u8 servoPhase[]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 
-//s8 offset[]={10,13,18,12,12,9,14,17,21,16,9,15,17,12,15,4,0,-8,-8,-2,3,9,16,10,24,18,10,9,15,7};
-//s8 offset[]={-19,-20,-15,-21,-18,-21,-18,-16,-16,-17,-21,-19,-14,-18,-17,-33,-35,-42,-44,-38,-35,-28,-20,-26,-17,-23,-29,-30,-27,-32};//4000
 s8 offset[]={-15,-15,-11,-16,-14,-16,-13,-11,-11,-12,-16,-13,-9,-12,-12,-28,-30,-38,-40,-34,-31,-26,-16,-23,-13,-18,-25,-26,-23,-28};
-
-//thursday morning - rotated!: -15,-15,-11,-16,-14,-16,-13,-11,-11,-12,-16,-13,-9,-12,-12,-33,-34,-41,-42,-38,-34,-28,-19,-27,-16,-21,-27,-29,-25,-31
-
-//thursday evening: -12,-13,-9,-13,-10,-12,-9,-9,-7,-7,-13,-11,-5,-10,-10,-32,-33,-40,-42,-38,-33,-29,-20,-27,-16,-21,-28,-30,-26,-30
-
 
 
 //Long hold back
@@ -128,9 +116,7 @@ void USART1_IRQHandler(void)
       bytenumber= 2;
     } else if (bytenumber==2){
 
-      if ((status & 0xF0) == 0x90 && i!=0) {
-        //noteOn
-        //u8 note=bytetwo%30;
+      if ((status & 0xF0) == 0x90 && i!=0) { //noteOn
         u8 note=noteToServo[bytetwo];
         if (note!=255 && (!servoPhase[note] || servoPhase[note] >8)) {
           servoPhase[note]=1;
@@ -251,11 +237,6 @@ int main()
 
   RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1, ENABLE);
 
-  // GPIO_InitStruct.GPIO_Pin = GPIO_Pin_9;
-  // GPIO_InitStruct.GPIO_Mode = GPIO_Mode_AF_PP;
-  // GPIO_InitStruct.GPIO_Speed = GPIO_Speed_50MHz;
-  // GPIO_Init(GPIOA, &GPIO_InitStruct);
-
   GPIO_InitStruct.GPIO_Pin  = GPIO_Pin_10;
   GPIO_InitStruct.GPIO_Mode = GPIO_Mode_IN_FLOATING;
   GPIO_Init(GPIOA, &GPIO_InitStruct);
@@ -286,13 +267,11 @@ int main()
 
 
 
-
-
   RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
 
   TIM_TimeBaseInitStruct.TIM_Prescaler = 0;
   TIM_TimeBaseInitStruct.TIM_CounterMode = TIM_CounterMode_Up;
-  TIM_TimeBaseInitStruct.TIM_Period = 700;//700;
+  TIM_TimeBaseInitStruct.TIM_Period = 700;
   TIM_TimeBaseInitStruct.TIM_ClockDivision = TIM_CKD_DIV1;
   TIM_TimeBaseInitStruct.TIM_RepetitionCounter = 0;
   TIM_TimeBaseInit(TIM3, &TIM_TimeBaseInitStruct);
@@ -310,10 +289,9 @@ int main()
 
 
 
-
-    for (u8 i=0; i<30; i++){
-      servoPhase[i]=8;
-    }
+  for (u8 i=0; i<30; i++){
+    servoPhase[i]=8;
+  }
 
 
 
