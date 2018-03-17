@@ -1,0 +1,870 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset=utf-8>
+<title>Midi to Moshi</title>
+</head>
+<body>
+
+<div id="drop_zone">
+
+<div id="output">Drag and drop a midi file here to convert </div>
+<div id="output2"></div>
+
+<div style="overflow:auto; overflow-x:scroll;">
+<canvas id="c" style="border: 1px solid black;" width=5000 height=384></canvas>
+</div>
+
+<label>Hscale:<input type=range oninput='Hscale=this.value*this.value/100000; window.redraw&&redraw()' autocomplete=off value=175 min=1 max=500></label><br>
+<label>Transpose:<input type=range oninput='transpose = this.value-128; window.redraw&&redraw(); ' autocomplete=off value=128 min=1 max=255 style='width:1000px'></label><br>
+
+<label><input type=checkbox autocomplete=off oninput='wrap=(this.checked);window.redraw&&redraw();'>Wrap</label><br>
+<label><input type=checkbox autocomplete=off oninput='limitMin=(this.checked);window.redraw&&redraw();'>Limit min</label><br>
+Skip: <input type=number autocomplete=off oninput='skip=1*this.value' value=0>mm<br>
+Max Length: <input type=number autocomplete=off oninput='truncate=1*this.value' value=150>mm<br>
+
+
+<br><br>
+<a href=# onclick='if(window.redo) window.redo(); return false;'>redo</a> 
+<a href=# onclick='if(window.redraw) window.redraw(); return false;'>redraw</a>
+<br><br>
+<a href=# id=down download=moshi.mdr onclick='exportMoshi();'>Export Moshi</a>
+
+<pre id=debug style='position:fixed;top:0;right:0'></pre>
+
+<script>
+/* Wrapper for accessing strings through sequential reads */
+function Stream(str) {
+	var position = 0;
+	
+	function read(length) {
+		var result = str.substr(position, length);
+		position += length;
+		return result;
+	}
+	
+	/* read a big-endian 32-bit integer */
+	function readInt32() {
+		var result = (
+			(str.charCodeAt(position) << 24)
+			+ (str.charCodeAt(position + 1) << 16)
+			+ (str.charCodeAt(position + 2) << 8)
+			+ str.charCodeAt(position + 3));
+		position += 4;
+		return result;
+	}
+
+	/* read a big-endian 16-bit integer */
+	function readInt16() {
+		var result = (
+			(str.charCodeAt(position) << 8)
+			+ str.charCodeAt(position + 1));
+		position += 2;
+		return result;
+	}
+	
+	/* read an 8-bit integer */
+	function readInt8() {
+		var result = str.charCodeAt(position);
+		position += 1;
+		return result;
+	}
+	
+	function eof() {
+		return position >= str.length;
+	}
+	
+	/* read a MIDI-style variable-length integer
+		(big-endian value in groups of 7 bits,
+		with top bit set to signify that another byte follows)
+	*/
+	function readVarInt() {
+		var result = 0;
+		while (true) {
+			var b = readInt8();
+			if (b & 0x80) {
+				result += (b & 0x7f);
+				result <<= 7;
+			} else {
+				/* b is the last byte */
+				return result + b;
+			}
+		}
+	}
+	
+	return {
+		'eof': eof,
+		'read': read,
+		'readInt32': readInt32,
+		'readInt16': readInt16,
+		'readInt8': readInt8,
+		'readVarInt': readVarInt
+	}
+}
+
+
+/*
+class to parse the .mid file format
+(depends on stream.js)
+*/
+function MidiFile(data) {
+	function readChunk(stream) {
+		var id = stream.read(4);
+		var length = stream.readInt32();
+		return {
+			'id': id,
+			'length': length,
+			'data': stream.read(length)
+		};
+	}
+	
+	var lastEventTypeByte;
+	
+	function readEvent(stream) {
+		var event = {};
+		event.deltaTime = stream.readVarInt();
+		var eventTypeByte = stream.readInt8();
+		if ((eventTypeByte & 0xf0) == 0xf0) {
+			/* system / meta event */
+			if (eventTypeByte == 0xff) {
+				/* meta event */
+				event.type = 'meta';
+				var subtypeByte = stream.readInt8();
+				var length = stream.readVarInt();
+				switch(subtypeByte) {
+					case 0x00:
+						event.subtype = 'sequenceNumber';
+						if (length != 2) throw "Expected length for sequenceNumber event is 2, got " + length;
+						event.number = stream.readInt16();
+						return event;
+					case 0x01:
+						event.subtype = 'text';
+						event.text = stream.read(length);
+						return event;
+					case 0x02:
+						event.subtype = 'copyrightNotice';
+						event.text = stream.read(length);
+						return event;
+					case 0x03:
+						event.subtype = 'trackName';
+						event.text = stream.read(length);
+						return event;
+					case 0x04:
+						event.subtype = 'instrumentName';
+						event.text = stream.read(length);
+						return event;
+					case 0x05:
+						event.subtype = 'lyrics';
+						event.text = stream.read(length);
+						return event;
+					case 0x06:
+						event.subtype = 'marker';
+						event.text = stream.read(length);
+						return event;
+					case 0x07:
+						event.subtype = 'cuePoint';
+						event.text = stream.read(length);
+						return event;
+					case 0x20:
+						event.subtype = 'midiChannelPrefix';
+						if (length != 1) throw "Expected length for midiChannelPrefix event is 1, got " + length;
+						event.channel = stream.readInt8();
+						return event;
+					case 0x2f:
+						event.subtype = 'endOfTrack';
+						if (length != 0) throw "Expected length for endOfTrack event is 0, got " + length;
+						return event;
+					case 0x51:
+						event.subtype = 'setTempo';
+						if (length != 3) throw "Expected length for setTempo event is 3, got " + length;
+						event.microsecondsPerBeat = (
+							(stream.readInt8() << 16)
+							+ (stream.readInt8() << 8)
+							+ stream.readInt8()
+						)
+						return event;
+					case 0x54:
+						event.subtype = 'smpteOffset';
+						if (length != 5) throw "Expected length for smpteOffset event is 5, got " + length;
+						var hourByte = stream.readInt8();
+						event.frameRate = {
+							0x00: 24, 0x20: 25, 0x40: 29, 0x60: 30
+						}[hourByte & 0x60];
+						event.hour = hourByte & 0x1f;
+						event.min = stream.readInt8();
+						event.sec = stream.readInt8();
+						event.frame = stream.readInt8();
+						event.subframe = stream.readInt8();
+						return event;
+					case 0x58:
+						event.subtype = 'timeSignature';
+						if (length != 4) throw "Expected length for timeSignature event is 4, got " + length;
+						event.numerator = stream.readInt8();
+						event.denominator = Math.pow(2, stream.readInt8());
+						event.metronome = stream.readInt8();
+						event.thirtyseconds = stream.readInt8();
+						return event;
+					case 0x59:
+						event.subtype = 'keySignature';
+						if (length != 2) throw "Expected length for keySignature event is 2, got " + length;
+						event.key = stream.readInt8();
+						event.scale = stream.readInt8();
+						return event;
+					case 0x7f:
+						event.subtype = 'sequencerSpecific';
+						event.data = stream.read(length);
+						return event;
+					default:
+						// console.log("Unrecognised meta event subtype: " + subtypeByte);
+						event.subtype = 'unknown'
+						event.data = stream.read(length);
+						return event;
+				}
+				event.data = stream.read(length);
+				return event;
+			} else if (eventTypeByte == 0xf0) {
+				event.type = 'sysEx';
+				var length = stream.readVarInt();
+				event.data = stream.read(length);
+				return event;
+			} else if (eventTypeByte == 0xf7) {
+				event.type = 'dividedSysEx';
+				var length = stream.readVarInt();
+				event.data = stream.read(length);
+				return event;
+			} else {
+				throw "Unrecognised MIDI event type byte: " + eventTypeByte;
+			}
+		} else {
+			/* channel event */
+			var param1;
+			if ((eventTypeByte & 0x80) == 0) {
+				/* running status - reuse lastEventTypeByte as the event type.
+					eventTypeByte is actually the first parameter
+				*/
+				param1 = eventTypeByte;
+				eventTypeByte = lastEventTypeByte;
+			} else {
+				param1 = stream.readInt8();
+				lastEventTypeByte = eventTypeByte;
+			}
+			var eventType = eventTypeByte >> 4;
+			event.channel = eventTypeByte & 0x0f;
+			event.type = 'channel';
+			switch (eventType) {
+				case 0x08:
+					event.subtype = 'noteOff';
+					event.noteNumber = param1;
+					event.velocity = stream.readInt8();
+					return event;
+				case 0x09:
+					event.noteNumber = param1;
+					event.velocity = stream.readInt8();
+					if (event.velocity == 0) {
+						event.subtype = 'noteOff';
+					} else {
+						event.subtype = 'noteOn';
+					}
+					return event;
+				case 0x0a:
+					event.subtype = 'noteAftertouch';
+					event.noteNumber = param1;
+					event.amount = stream.readInt8();
+					return event;
+				case 0x0b:
+					event.subtype = 'controller';
+					event.controllerType = param1;
+					event.value = stream.readInt8();
+					return event;
+				case 0x0c:
+					event.subtype = 'programChange';
+					event.programNumber = param1;
+					return event;
+				case 0x0d:
+					event.subtype = 'channelAftertouch';
+					event.amount = param1;
+					return event;
+				case 0x0e:
+					event.subtype = 'pitchBend';
+					event.value = param1 + (stream.readInt8() << 7);
+					return event;
+				default:
+					throw "Unrecognised MIDI event type: " + eventType
+			}
+		}
+	}
+	
+	stream = Stream(data);
+	var headerChunk = readChunk(stream);
+	if (headerChunk.id != 'MThd' || headerChunk.length != 6) {
+		throw "Bad .mid file - header not found";
+	}
+	var headerStream = Stream(headerChunk.data);
+	var formatType = headerStream.readInt16();
+	var trackCount = headerStream.readInt16();
+	var timeDivision = headerStream.readInt16();
+	
+	if (timeDivision & 0x8000) {
+		throw "Expressing time division in SMTPE frames is not supported yet"
+	} else {
+		ticksPerBeat = timeDivision;
+	}
+	
+	var header = {
+		'formatType': formatType,
+		'trackCount': trackCount,
+		'ticksPerBeat': ticksPerBeat
+	}
+	var tracks = [];
+	for (var i = 0; i < header.trackCount; i++) {
+		tracks[i] = [];
+		var trackChunk = readChunk(stream);
+		if (trackChunk.id != 'MTrk') {
+			throw "Unexpected chunk - expected MTrk, got "+ trackChunk.id;
+		}
+		var trackStream = Stream(trackChunk.data);
+		while (!trackStream.eof()) {
+			var event = readEvent(trackStream);
+			tracks[i].push(event);
+			//console.log(event);
+		}
+	}
+	
+	return {
+		'header': header,
+		'tracks': tracks
+	}
+}
+
+
+function Replayer(midiFile, synth, onFinish) {
+	var trackStates = [];
+	var beatsPerMinute = 120;
+	var ticksPerBeat = midiFile.header.ticksPerBeat;
+	var channelCount = 16;
+	
+	for (var i = 0; i < midiFile.tracks.length; i++) {
+		trackStates[i] = {
+			'nextEventIndex': 0,
+			'ticksToNextEvent': (
+				midiFile.tracks[i].length ?
+					midiFile.tracks[i][0].deltaTime :
+					null
+			)
+		};
+	}
+	
+	function Channel(num) {
+		
+		var generatorsByNote = {};
+		var currentProgram = PianoProgram;
+		var tempLastNote=1
+		
+		function noteOn(note, velocity) {
+			if (num!=9) {
+			  NoteOnStack.push([FrameNumber,note])
+			}
+		
+			if (generatorsByNote[note] && !generatorsByNote[note].released) {
+				generatorsByNote[note].noteOff(); 
+			}
+    
+			generator = currentProgram.createNote(note, velocity);
+			synth.addGenerator(generator);
+			generatorsByNote[note] = generator;
+		}
+		function noteOff(note, velocity) {
+      
+      generatorsByNote[note].noteOff(velocity);
+      
+		}
+		function setProgram(programNumber) {
+
+      currentProgram = PROGRAMS[programNumber] || PianoProgram;
+		}
+		
+		return {
+			'noteOn': noteOn,
+			'noteOff': noteOff,
+			'setProgram': setProgram
+		}
+	}
+	
+	var channels = [];
+	for (var i = 0; i < channelCount; i++) {
+		channels[i] = Channel(i);
+	}
+  
+  channels[9].setProgram(128);  //Set channel 10 to drums
+  
+	var nextEventInfo;
+	var samplesToNextEvent = 0;
+	
+	function getNextEvent() {
+		var ticksToNextEvent = null;
+		var nextEventTrack = null;
+		var nextEventIndex = null;
+		
+		for (var i = 0; i < trackStates.length; i++) {
+			if (
+				trackStates[i].ticksToNextEvent != null
+				&& (ticksToNextEvent == null || trackStates[i].ticksToNextEvent < ticksToNextEvent)
+			) {
+				ticksToNextEvent = trackStates[i].ticksToNextEvent;
+				nextEventTrack = i;
+				nextEventIndex = trackStates[i].nextEventIndex;
+			}
+		}
+		if (nextEventTrack != null) {
+			/* consume event from that track */
+			var nextEvent = midiFile.tracks[nextEventTrack][nextEventIndex];
+			if (midiFile.tracks[nextEventTrack][nextEventIndex + 1]) {
+				trackStates[nextEventTrack].ticksToNextEvent += midiFile.tracks[nextEventTrack][nextEventIndex + 1].deltaTime;
+			} else {
+				trackStates[nextEventTrack].ticksToNextEvent = null;
+			}
+			trackStates[nextEventTrack].nextEventIndex += 1;
+			/* advance timings on all tracks by ticksToNextEvent */
+			for (var i = 0; i < trackStates.length; i++) {
+				if (trackStates[i].ticksToNextEvent != null) {
+					trackStates[i].ticksToNextEvent -= ticksToNextEvent
+				}
+			}
+			nextEventInfo = {
+				'ticksToEvent': ticksToNextEvent,
+				'event': nextEvent,
+				'track': nextEventTrack
+			}
+			var beatsToNextEvent = ticksToNextEvent / ticksPerBeat;
+			var secondsToNextEvent = beatsToNextEvent / (beatsPerMinute / 60);
+			samplesToNextEvent += secondsToNextEvent * synth.sampleRate;
+		} else {
+			nextEventInfo = null;
+			samplesToNextEvent = null;
+			self.finished = true;
+      onFinish();
+		}
+	}
+	
+	getNextEvent();
+	
+	function generate(samples) {
+		var data = new Array(samples*2);
+		
+		
+		var samplesRemaining = samples;
+		var dataOffset = 0;
+		
+		while (true) {
+			if (samplesToNextEvent != null && samplesToNextEvent <= samplesRemaining) {
+				/* generate samplesToNextEvent samples, process event and repeat */
+				var samplesToGenerate = Math.ceil(samplesToNextEvent);
+				if (samplesToGenerate > 0) {
+					synth.generateIntoBuffer(samplesToGenerate, data, dataOffset);
+					dataOffset += samplesToGenerate * 2;
+					samplesRemaining -= samplesToGenerate;
+					samplesToNextEvent -= samplesToGenerate;
+				}
+				
+				handleEvent();
+				getNextEvent();
+			} else {
+				/* generate samples to end of buffer */
+				if (samplesRemaining > 0) {
+					synth.generateIntoBuffer(samplesRemaining, data, dataOffset);
+					samplesToNextEvent -= samplesRemaining;
+				}
+				break;
+			}
+		}
+		return data;
+	}
+	
+	function handleEvent() {
+		var event = nextEventInfo.event;
+		switch (event.type) {
+			case 'meta':
+				switch (event.subtype) {
+					case 'setTempo':
+						beatsPerMinute = 60000000 / event.microsecondsPerBeat
+				}
+				break;
+			case 'channel':
+				//if (event.channel!=9)  //Filter out drum track (channel 10)
+        switch (event.subtype) {
+					case 'noteOn':
+						channels[event.channel].noteOn(event.noteNumber, event.velocity);
+						break;
+					case 'noteOff':
+						channels[event.channel].noteOff(event.noteNumber, event.velocity);
+						break;
+					case 'programChange':
+            if (event.channel!=9) //Channel 10 is always drum track
+						  channels[event.channel].setProgram(event.programNumber);
+						break;
+				}
+				break;
+		}
+	}
+	
+	function replay(audio) {
+		console.log('replay');
+		audio.write(generate(44100));
+		setTimeout(function() {replay(audio)}, 10);
+	}
+	
+	var self = {
+		'replay': replay,
+		'generate': generate,
+		'finished': false
+	}
+	return self;
+}
+
+
+
+
+
+function ADSRGenerator() {
+	var self = {'alive': true}
+
+	self.noteOff = function() {self.alive = false;}
+	self.generate = function() {}
+	
+	return self;
+}
+
+
+
+
+PianoProgram = {
+	'createNote': ADSRGenerator
+}
+
+
+
+
+PROGRAMS = {
+};
+
+function Synth(sampleRate) {
+	
+	var generators = [];
+	
+	function addGenerator(generator) {
+		generators.push(generator);
+	}
+	
+	function generate(samples) {
+		var data = new Array(samples*2);
+		generateIntoBuffer(samples, data, 0);
+		return data;
+	}
+	
+	function generateIntoBuffer(samplesToGenerate, buffer, offset) {
+		for (var i = offset; i < offset + samplesToGenerate * 2; i++) {
+			buffer[i] = 0;
+		}
+		for (var i = generators.length - 1; i >= 0; i--) {
+			generators[i].generate(buffer, offset, samplesToGenerate);
+			if (!generators[i].alive) generators.splice(i, 1);
+		}
+	}
+	
+	return {
+		'sampleRate': sampleRate,
+		'addGenerator': addGenerator,
+		'generate': generate,
+		'generateIntoBuffer': generateIntoBuffer
+	}
+}
+
+
+
+
+
+c=document.getElementById('c');
+ctx=c.getContext('2d');
+Hscale=0.3
+DPI=1/10; //mm per pixel
+transpose=0;
+wrap=0;
+skip=0;
+truncate=150;
+limitMin=false;
+
+noteLookup = [ 
+  48, //C3
+  50, //D3
+  55, //G3
+  57, //A3
+  59, //B3
+  60,
+  62,
+  64,
+  65, //F4
+  66,
+  67,
+  68,
+  69,
+  70,
+  71,
+  72,
+  73,
+  74,
+  75,
+  76,
+  77,
+  78,
+  79,
+  80,
+  81,
+  82,
+  83, //B5
+  84, //C6
+  86, //D6
+  88
+]
+
+
+
+/*
+
+paper width 69.8mm
+
+grid width 58.0mm
+
+30 notes, on grid lines
+  => inter note spacing 2mm
+
+low end offset 6.2mm
+top end offset 5.6mm
+
+
+laser kerf ~0.25 radius
+
+*/
+
+
+NoteOnStack=[];
+parsedNoteStack=[];
+function AudioPlayer(generator) {
+
+
+  sampleRate = 44100; 
+
+  NoteOnStack=[];
+  FrameNumber=0;
+  ctx.clearRect(0,0,5000,384);
+
+	var requestStop = false;
+
+ 	prevPair="";
+	pairCount=1;   
+	notePair=""
+
+  var TempGen=function (e) {
+
+    for (var i=1000;i--&&!generator.finished;){
+
+      
+      generator.generate(128); //735
+      FrameNumber++
+
+  
+    }
+    for (var i=0;i<NoteOnStack.length;i++)
+      ctx.fillRect(NoteOnStack[i][0]*Hscale, 384-NoteOnStack[i][1]*3, 3,3);
+    
+    
+    document.getElementById("output2").innerHTML=NoteOnStack.length
+    if (!generator.finished && !requestStop) window.setTimeout(TempGen, 1);
+    else {
+  
+
+      (window.redraw=function(){
+
+        ctx.clearRect(0,0,5000,384);
+
+        ctx.fillStyle='#ddd';
+        for (var i=0;i<noteLookup.length;i++){
+          ctx.fillRect(0,384-noteLookup[i]*3,5000,3);
+        }
+
+        ctx.strokeStyle='#aaa'
+        ctx.beginPath();
+        ctx.moveTo(0.5+Math.round(skip/DPI),0);
+        ctx.lineTo(0.5+Math.round(skip/DPI),385);
+        ctx.moveTo(0.5+Math.round(truncate/DPI),385);
+        ctx.lineTo(0.5+Math.round(truncate/DPI),0);
+        ctx.stroke();
+        
+        parsedNoteStack=[];
+
+        var minInter=1e9, lastNotes=[], throwaway=6.0/(Hscale*DPI);
+        function pushNote(n){
+          if (typeof lastNotes[n[1]]!=="undefined") {
+            if (n[0] - lastNotes[n[1]] < throwaway && limitMin) {ctx.fillStyle='#eee';return false;}
+            if (n[0] - lastNotes[n[1]] < minInter) {
+              minInter = n[0] - lastNotes[n[1]];
+            }
+          }
+          lastNotes[n[1]]=n[0];
+          parsedNoteStack.push(n);
+          return true;
+        }
+
+        for (var i=0;i<NoteOnStack.length;i++) {
+          var n= NoteOnStack[i][1] + transpose;
+          if (noteLookup.indexOf(n)==-1) {
+            ctx.fillStyle= 'red';
+            if (wrap) {
+              var d=n<66 ? 12:-12;
+              while (noteLookup.indexOf(n)==-1) n+=d;
+              pushNote([NoteOnStack[i][0],n]);
+            }
+          } else {
+            ctx.fillStyle= 'black';
+            pushNote([NoteOnStack[i][0],n]);
+          }
+
+          ctx.fillRect(NoteOnStack[i][0]*Hscale, 384-n*3, 3,3);
+          
+        }
+        
+        var debug="Staged: "+parsedNoteStack.length +" of "+NoteOnStack.length+"\nTranspose: "+transpose+"\n";
+        if (!parsedNoteStack.length) {document.getElementById('debug').innerHTML=debug;return;}
+
+        /*var minInter=1e9, lastNotes=[];
+        for (var i=0;i<parsedNoteStack.length;i++) {
+          var n=parsedNoteStack[i];
+          if (typeof lastNotes[n[1]]!=="undefined") {
+            if (n[0] - lastNotes[n[1]] < minInter) {
+              minInter = n[0] - lastNotes[n[1]];
+            }
+          }
+          lastNotes[n[1]]=n[0];
+        }*/
+        debug+="MinInter: "+minInter+" : "+(minInter*Hscale*DPI).toFixed(2)+"mm\n";
+
+        debug +="Total Length: "+(Hscale*DPI*parsedNoteStack[parsedNoteStack.length-1][0]).toFixed(2)+"mm\n";
+        
+
+        document.getElementById('debug').innerHTML=debug;
+
+      })();
+  
+      
+    }
+  }
+  TempGen();
+  
+  return {
+    'stop': function() {
+      requestStop = true;
+
+    },
+    'type': ''
+  }
+
+} 
+
+
+
+function exportMoshi(){
+  document.getElementById('down').href='#';
+  if (files.length==0||NoteOnStack.length==0) return false;
+  
+  var output="MemoImage Bitmap,0,F6E10300789CEDD3B10DC230004541472C424941CD00F4ECCC102CC012B421200A06782808EE4BD7C495ADBCE3E976DD8CC70E8BDDE2B2D84F634C63FBFC7E7E9DBF6F9E6700000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000809FB4D6D6BE377C827F1B3A7A828696A0A327E8E8093A7A828696A0A327E8E8093A7A828E9EA0A125E8E8093A7A828E9EA0A3276868093A7A828E9EA0A3276868093A7A828E9EA0A327E8E8091A5A828E9EA0A327E8E8091A5A828E9EA0A327E8E8093A7A828696A0A327E8E8093A7A828E9EA0A125E8E8093A7A828E9EA0A125E8E8093A7A828E9EA0A327E8E8093A7A828E9EA0A327E8E8093A7A828E9EA0A327E8E8093A7A828E9EA0A327E8E8093A7A828E9EA0A327E8E8093A7A828E9EA0A327E8E8093A7A82CEB76FEDF70100000000000000807F7007797AF53E%0D"
+            +"MDR Moshidraw file 2.0%0DCreateDate 04/10/2017 16:15:47%0DScale 1.5,1.5,0.1%0DStarzuo -4,-4%0DSetPenColor 0%0DSetBrushColor 7%0DSetLineWidth 1%0DPageX 210%0DPageY 297%0DGetBilv 1%0DSetBilv 1%0DFunits0%0DLayer Default,1,0,0%0DLayerOption1 Noname,100,0,0%0DLayerOption2 0,1,0,5,2%0DLayerOption3 0,0,0%0DLayerOption4 1,0,1,0%0DLayerOption5 5,0,0%0DLayerOption6 1,0,3%0DLayerOption7 ?,60,23,0%0DLayerOption8 ?,1000,1000,1000%0DLayerOption9 ?,16,15,30%0D";
+
+  cn=4;
+  twidth = 10+ 200;//mm
+
+  function circle(x,y) {
+    output+="BeginObject Circle%0D  Layer=0%0D  Name=Circle"+(cn++)+"%0D  ID=4%0D  PenColor=0%0D  PenStyle=0%0D  PenMode=4%0D  PenWidth=1%0D  BrushColor=7%0D  BrushStyle=1%0D  Cursor=0%0D  DrawPointCount=0%0D  SelectColor=-1%0D  Linewidth=Hairline%0D  CopyMode=0%0D  Outtype=1%0D  BOOLEAN=129%0D  BOOLEAN1=8%0D  JD=0%0D  ddycenterX=0%0D  ddycenterY=0%0D  "
+    +"CENTER="+(x+30.0)+"_"+( y +15.6)+"|0%0D  Radius=0.9%0DEndObject%0D";
+
+  }
+
+  var stack = wrap? parsedNoteStack : NoteOnStack;
+
+  for (var i=0;i<stack.length;i++) {
+    var n= stack[i][1];
+
+    if (noteLookup.indexOf(n)!=-1) {
+      var x=stack[i][0]*Hscale*DPI - skip;
+      if (x>=0 && x<= truncate) circle( x ,58.0-noteLookup.indexOf(n)*2.0 )
+    }
+  }
+
+
+  output+="BeginObject Line%0D  Layer=0%0D  Name=Line0%0D  ID=0%0D  PenColor=0%0D  PenStyle=0%0D  PenMode=4%0D  PenWidth=1%0D  BrushColor=7%0D  BrushStyle=1%0D  Cursor=0%0D  DrawPointCount=0%0D  SelectColor=-1%0D  Linewidth=Hairline%0D  CopyMode=0%0D  Outtype=1%0D  BOOLEAN=129%0D  BOOLEAN1=8%0D  JD=0%0D  ddycenterX=0%0D  ddycenterY=0%0D  P1=10_10|0%0D  "
+        +"P2="+twidth+"_10|0%0DEndObject%0DBeginObject Line%0D  Layer=0%0D  Name=Line1%0D  ID=1%0D  PenColor=0%0D  PenStyle=0%0D  PenMode=4%0D  PenWidth=1%0D  BrushColor=7%0D  BrushStyle=1%0D  Cursor=0%0D  DrawPointCount=0%0D  SelectColor=-1%0D  Linewidth=Hairline%0D  CopyMode=0%0D  Outtype=1%0D  BOOLEAN=129%0D  BOOLEAN1=8%0D  JD=0%0D  ddycenterX=0%0D  ddycenterY=0%0D  P1=10_10|0%0D  P2=10_35|0%0DEndObject%0DBeginObject Line%0D  Layer=0%0D  Name=Line2%0D  ID=2%0D  PenColor=0%0D  PenStyle=0%0D  PenMode=4%0D  PenWidth=1%0D  BrushColor=7%0D  BrushStyle=1%0D  Cursor=0%0D  DrawPointCount=0%0D  SelectColor=-1%0D  Linewidth=Hairline%0D  CopyMode=0%0D  Outtype=1%0D  BOOLEAN=129%0D  BOOLEAN1=8%0D  JD=0%0D  ddycenterX=0%0D  ddycenterY=0%0D  P1=10_35|0%0D  P2=20_79.8|0%0DEndObject%0DBeginObject Line%0D  Layer=0%0D  Name=Line3%0D  ID=3%0D  PenColor=0%0D  PenStyle=0%0D  PenMode=4%0D  PenWidth=1%0D  BrushColor=7%0D  BrushStyle=1%0D  Cursor=0%0D  DrawPointCount=0%0D  SelectColor=-1%0D  Linewidth=Hairline%0D  CopyMode=0%0D  Outtype=1%0D  BOOLEAN=129%0D  BOOLEAN1=8%0D  JD=0%0D  ddycenterX=0%0D  ddycenterY=0%0D  P1=20_79.8|0%0D  "
+        +"P2="+twidth+"_79.8|0%0DEndObject%0D";
+  document.getElementById('down').download=files[0].name.split('.')[0] + "_t"+transpose+"w"+(wrap*1)+"h"+Hscale.toString().replace(/\./,'-')+(skip?"s"+skip:'')  +".mdr"
+  document.getElementById('down').href='data:text/plain,'+output;
+}
+
+
+
+
+
+
+
+
+
+function handleFileSelect(evt) {
+  evt.stopPropagation();
+  evt.preventDefault();
+
+  files = evt.dataTransfer.files; 
+  // files is a FileList of File objects.
+
+  if (files[0].name.indexOf(".mid")==-1) return;
+  
+  remove_button=function() {  document.getElementById("output").innerHTML="Drag and drop a midi file here to convert "; }  
+  document.getElementById("output").innerHTML=files[0].name+" <button onclick='audio.stop();remove_button();'>Stop</button>";
+    
+  var reader = new FileReader();
+  reader.onload = (function(theFile) {
+    return function(e) {
+      if (typeof audio !=="undefined") audio.stop();
+      midiFile = MidiFile(e.target.result);
+			synth = Synth(44100);
+			replayer = Replayer(midiFile, synth, remove_button );
+//			if (document.getElementById("toFile").checked) audio = AudioPlayer(replayer, files[0].name.replace(".mid",".wav")); else
+      audio = AudioPlayer(replayer);
+    };
+  })(files[0]);
+    
+  reader.readAsBinaryString(files[0]);
+
+  window.redo=function(){reader.readAsBinaryString(files[0]);}
+}
+
+function handleDragOver(evt) {
+  evt.stopPropagation();
+  evt.preventDefault();
+  evt.dataTransfer.dropEffect = 'copy'; // Explicitly show this is a copy.
+}
+
+
+var dropZone = document.getElementById('drop_zone');
+dropZone.addEventListener('dragover', handleDragOver, false);
+dropZone.addEventListener('drop', handleFileSelect, false);
+
+
+
+
+
+
+
+
+
+</script>
+
+
+</div>
+<br><br><br><br><br><a href=https://mitxela.com/projects/musicbox>Back to Music Box Project Page</a>
+</body>
+</html>
